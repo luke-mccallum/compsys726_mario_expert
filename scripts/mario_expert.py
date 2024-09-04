@@ -8,11 +8,33 @@ Original Mario Manual: https://www.thegameisafootarcade.com/wp-content/uploads/2
 
 import json
 import logging
-import random
-
+import math
 import cv2
+
+from enum import IntEnum
 from mario_environment import MarioEnvironment
 from pyboy.utils import WindowEvent
+
+class Sprites(IntEnum):
+    AIR = 0
+    MARIO = 1
+    BLOCK = 10
+    MOVING_PLATFORM = 11
+    BRICK = 12
+    POWERUP_BLOCK = 13
+    PIPE = 14
+    GOOMBA = 15
+    KOOPA = 16
+    FLY = 18
+    BEE = 19
+    SHELL = 25
+
+class Actions(IntEnum):
+    LEFT = 1
+    RIGHT = 2
+    UP = 3
+    JUMP = 4
+    SPRINT = 5
 
 
 class MarioController(MarioEnvironment):
@@ -29,8 +51,8 @@ class MarioController(MarioEnvironment):
 
     def __init__(
         self,
-        act_freq: int = 10,
-        emulation_speed: int = 0,
+        act_freq: int = 1,
+        emulation_speed: int = 1,
         headless: bool = False,
     ) -> None:
         super().__init__(
@@ -63,22 +85,36 @@ class MarioController(MarioEnvironment):
         self.valid_actions = valid_actions
         self.release_button = release_button
 
-    def run_action(self, action: int) -> None:
-        """
-        This is a very basic example of how this function could be implemented
+    def run_action(self, action, duration) -> None:
+        if action == Actions.JUMP:
+            self.pyboy.send_input(self.valid_actions[Actions.RIGHT.value])
+            self.pyboy.send_input(self.valid_actions[Actions.SPRINT.value])
+            self.pyboy.send_input(self.valid_actions[Actions.JUMP.value])
 
-        As part of this assignment your job is to modify this function to better suit your needs
+            for _ in range(self.act_freq * duration):
+                self.pyboy.tick()
 
-        You can change the action type to whatever you want or need just remember the base control of the game is pushing buttons
-        """
+            self.pyboy.send_input(self.release_button[Actions.JUMP.value])
+            self.pyboy.send_input(self.release_button[Actions.SPRINT.value])
+            self.pyboy.send_input(self.release_button[Actions.RIGHT.value])
 
-        # Simply toggles the buttons being on or off for a duration of act_freq
-        self.pyboy.send_input(self.valid_actions[action])
+        elif action == Actions.RIGHT:
+            self.pyboy.send_input(self.valid_actions[Actions.RIGHT.value])
+            self.pyboy.send_input(self.valid_actions[Actions.SPRINT.value])
 
-        for _ in range(self.act_freq):
-            self.pyboy.tick()
+            for _ in range(self.act_freq * duration):
+                self.pyboy.tick()
 
-        self.pyboy.send_input(self.release_button[action])
+            self.pyboy.send_input(self.release_button[Actions.SPRINT.value])
+            self.pyboy.send_input(self.release_button[Actions.RIGHT.value])
+
+        else:
+            self.pyboy.send_input(self.valid_actions[action.value])
+
+            for _ in range(self.act_freq * duration):
+                self.pyboy.tick()
+
+            self.pyboy.send_input(self.release_button[action.value])
 
 
 class MarioExpert:
@@ -96,19 +132,145 @@ class MarioExpert:
 
     def __init__(self, results_path: str, headless=False):
         self.results_path = results_path
-
         self.environment = MarioController(headless=headless)
+        self.video = None 
+        self.prev_action = None
+        self.mario_pos = None
+        self.game_area = None
 
-        self.video = None
+    # Get coordinates of bottom right corner of Mario sprite
+    def get_mario_pos(self):
+        rows, cols = self.game_area.shape
+        for x in range(rows): 
+            for y in range(cols):
+                if self.game_area[x][y] == Sprites.MARIO.value:
+                    return (x + 1, y + 1)
+        return 0, 0
+    
+    # Check if there is air beneath Mario
+    def get_is_airborne(self):
+        if self.game_area[self.mario_pos[0] + 1][self.mario_pos[1]] == Sprites.AIR.value: 
+            return True;
+        return False;
+    
+    # Determine the position and identity of the nearest enemy in front of Mario
+    def get_enemy_info(self):
+        cols = self.game_area.shape[1]
+        mx, my = self.mario_pos
+        for xoffset in range(mx): 
+            x = mx - xoffset
+            for yoffset in range(cols - my):
+                y = my + yoffset
+                if self.game_area[x][y] >= Sprites.GOOMBA.value:
+                    return (mx - x, yoffset, self.game_area[x][y])
+        return (100, 100, 100)
+    
+    # Determine the position of obstacles blocking Mario
+    def get_obstacle_info(self):
+        mx, my = self.mario_pos
+        for y in range(6):
+            val = self.game_area[mx][my + y];
+            if val == Sprites.BRICK.value or val == Sprites.PIPE.value or val == Sprites.BLOCK.value:
+                x = mx
+                while self.game_area[x][my + y] != Sprites.AIR.value:
+                    x -= 1
+                return y, mx - x + 1
+        return 100, 100
+    
+    # Check if there is a platform above Mario
+    def get_platform_above(self):
+        mx, my = self.mario_pos
+        for y in range (6):
+            y += 1
+            for x in range(mx - 1):
+                if ((self.game_area[x][my + y] == Sprites.BRICK.value or 
+                     self.game_area[x][my + y] == Sprites.BLOCK.value) and
+                     self.game_area[x - 1][my + y] == Sprites.AIR.value and
+                     self.game_area[x][my + y - 1] == Sprites.AIR.value):
+                    return mx - x, y
+        return 100, 100
+    
+    # Determine the size and positions of pits in front of Mario
+    def get_pit_info(self):
+        rows, cols = self.game_area.shape
+        mx, my = self.mario_pos
+        for yoffset in range(cols - my):
+            y = my + yoffset
+            if self.game_area[mx + 1][y] == Sprites.AIR.value and self.game_area[15][y] == Sprites.AIR.value:
+                for a in range(rows):
+                    for boffset in range(cols - y):
+                        b = y + boffset
+                        if self.game_area[a][b] >= Sprites.BLOCK.value and self.game_area[a][b] <= Sprites.PIPE.value:
+                            return yoffset, mx - a, b - my
+        return 100, 100, 100
+    
+    # Get the distance to a point using the pythagorean theorem
+    def get_pythag_dist(self, a, b): return math.ceil(math.sqrt(a**2 + b**2))
 
+    # Choosing Action
     def choose_action(self):
-        state = self.environment.game_state()
-        frame = self.environment.grab_frame()
-        game_area = self.environment.game_area()
+        self.game_area = self.environment.game_area()
+        self.mario_pos = self.get_mario_pos()
 
-        # Implement your code here to choose the best action
-        # time.sleep(0.1)
-        return random.randint(0, len(self.environment.valid_actions) - 1)
+        # Break if Mario is out of bounds (Dead or Level Complete)
+        if (self.mario_pos[0] >= 15 or self.mario_pos[1] >= 15):
+            return Actions.RIGHT, 1
+        
+        enemy_info = self.get_enemy_info()
+        pit_info = self.get_pit_info()
+        obstacle_info = self.get_obstacle_info()
+        is_airborne = self.get_is_airborne()
+        platform = self.get_platform_above()
+
+        action = Actions.RIGHT
+        duration = 1
+
+        # Jump over upcoming obstacles
+        if obstacle_info[0] < 3 and is_airborne == False:
+            print("Jump over obstacle of height ", obstacle_info[1])
+            action = Actions.JUMP
+            duration = obstacle_info[1] * 2
+
+        # Jump onto upcoming platforms
+        elif platform[1] < 6 and platform[0] < 6 and platform[0] != obstacle_info[0]: 
+            print("Jump onto platform at ", platform)
+            action = Actions.JUMP
+            duration = platform[0] * 3
+            if (pit_info[0] < platform[1]): 
+                duration += 10
+        
+        # Check if Goomba or Koopa are right in front of Mario
+        elif enemy_info[2] < 18 and enemy_info[1] < 2:
+            print("Goomba/Koopa ahead")
+            # Prevent collision with enemy
+            if self.prev_action == Actions.JUMP:
+                action = Actions.LEFT
+                duration = 1
+            # Jump over/onto enemy
+            else: 
+                action = Actions.JUMP
+                duration = 1
+
+        # Jump over Flies
+        elif enemy_info[2] == 19 and enemy_info[1] < 4:
+            print("Fly ahead")
+            action = Actions.JUMP
+            duration = enemy_info[0] + 10
+
+        # Jump over upcoming pits
+        elif pit_info[0] < 2 and is_airborne == False:
+            print("Pit is", pit_info[0], "away and other side at", pit_info[1], pit_info[2])
+            action = Actions.JUMP
+            duration = self.get_pythag_dist(max(4, pit_info[1]), pit_info[2])
+
+        # Prevent Mario from getting stuck
+        if self.prev_action == action and action == Actions.JUMP:
+            print('Prevented jump loop')
+            action = Actions.RIGHT
+            duration = 1
+        self.prev_action = action
+
+        return action, duration
 
     def step(self):
         """
@@ -118,10 +280,10 @@ class MarioExpert:
         """
 
         # Choose an action - button press or other...
-        action = self.choose_action()
+        action, duration = self.choose_action()
 
         # Run the action on the environment
-        self.environment.run_action(action)
+        self.environment.run_action(action, duration)
 
     def play(self):
         """
